@@ -200,22 +200,61 @@ JOURS_SEMAINE = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "D
 MANUEL = "✍️ Saisir les jours manuellement"
 
 
-def heures_en_minutes(val):
-    """'07:30' -> 450. Valeur vide ou invalide -> 0."""
-    val = str(val).strip()
-    if ":" not in val:
+HEURES_JOUR_DEFAUT = 7.0  # 7 h travaillées = 1 jour complet
+
+
+# Codes qui ne constituent PAS une présence travaillée.
+# CP et ANR sont donc exclus du dénominateur de la moyenne.
+CODES_ABSENCE = {"CP", "ANR", "ABS", "ABSENCE", "CONGE", "CONGÉ", "RTT", "MALADIE"}
+
+def normaliser_code_planning(val):
+    if val is None:
+        return ""
+    return str(val).strip().upper()
+
+def valeur_en_minutes(val):
+    """Convertit une saisie du planning en minutes.
+    CP/ANR et autres codes d'absence = 0 minute.
+    """
+    code = normaliser_code_planning(val)
+    if code in CODES_ABSENCE:
         return 0
+    v = code.lower().replace(",", ".").replace("h", ":")
+    if v in ("", "none", "nan", "nat"):
+        return 0
+    if v.endswith(":"):
+        v += "00"
+    if ":" in v:
+        try:
+            h, m = v.split(":")[:2]
+            return int(h) * 60 + int(m or 0)
+        except Exception:
+            return None
     try:
-        h, m = map(int, val.split(":")[:2])
-        return h * 60 + m
+        x = float(v)
     except Exception:
-        return 0
+        return None
+    if x < 0:
+        return None
+    if x <= 1:
+        return round(x * HEURES_JOUR_DEFAUT * 60)
+    return round(x * 60)
 
+def valeur_en_jour(val, heures_jour=HEURES_JOUR_DEFAUT):
+    """Retourne uniquement la fraction de présence réellement travaillée."""
+    code = normaliser_code_planning(val)
+    if code in CODES_ABSENCE:
+        return 0.0
+    minutes = valeur_en_minutes(val)
+    if not minutes:
+        return 0.0
+    return min(minutes / (heures_jour * 60.0), 1.0)
 
-def compter_jours_travailles(nom_mecanicien, debut, fin):
-    """Compte les jours avec des heures > 0 dans le planning, entre debut et fin (inclus).
-    Retourne (nb_jours, semaines_non_saisies)."""
-    nb = 0
+def compter_jours_travailles(nom_mecanicien, debut, fin, heures_jour=HEURES_JOUR_DEFAUT):
+    """Compte uniquement les jours réellement travaillés.
+    CP, ANR et jours non renseignés = 0.
+    """
+    total = 0.0
     semaines_manquantes = set()
     jour = debut
     while jour <= fin:
@@ -223,15 +262,11 @@ def compter_jours_travailles(nom_mecanicien, debut, fin):
         nom_jour = JOURS_SEMAINE[num_jour - 1]
         key = f"Semaine {semaine}_{nom_mecanicien}_{nom_jour}"
         if key in st.session_state["planning_db"]:
-            minutes = heures_en_minutes(st.session_state["planning_db"][key])
+            total += valeur_en_jour(st.session_state["planning_db"][key], heures_jour)
         else:
-            # Semaine jamais ouverte dans le planning : valeur par défaut (lundi-vendredi = travaillé)
             semaines_manquantes.add(semaine)
-            minutes = 420 if num_jour <= 5 else 0
-        if minutes > 0:
-            nb += 1
         jour += datetime.timedelta(days=1)
-    return nb, semaines_manquantes
+    return round(total, 2), semaines_manquantes
 
 
 def trouver_mecanicien_planning(nom_fichier, noms_planning):
@@ -283,13 +318,14 @@ if menu_option == "📅 Planning & Saisie de Présence (S1 à S52)":
         for j in jours:
             key = f"{semaine_sel}_{mecanicien}_{j}"
             if key not in st.session_state["planning_db"]:
-                st.session_state["planning_db"][key] = "00:00" if j in ("Samedi", "Dimanche") else "07:00"
+                # Aucun jour n'est considéré comme travaillé tant qu'il n'est pas enregistré.
+                st.session_state["planning_db"][key] = "00:00"
             row[j] = st.session_state["planning_db"][key]
         records.append(row)
 
     df_planning = pd.DataFrame(records)
 
-    st.info("💡 **Exemples de saisie :** `07:00` (7h), `06:00` (6h), `05:00` (5h) ou minutes précises comme `06:45` ou `07:30`.")
+    st.info("💡 **Exemples de saisie :** `07:00` (7h = 1 jour), `06:00`, `05:00`, `06:45`... ou un **code de présence** de `0.1` à `0.7` (fraction de journée : `0.5` = demi-journée, soit 3h30). `00:00` ou `0` = absent. Pour la prime : 7h = 1 jour complet.")
 
     edited_df = st.data_editor(
         df_planning,
@@ -305,26 +341,36 @@ if menu_option == "📅 Planning & Saisie de Présence (S1 à S52)":
                 key = f"{semaine_sel}_{m_nom}_{j}"
                 st.session_state["planning_db"][key] = str(row[j])
         st.success(f"Données enregistrées avec succès pour la {semaine_sel} !")
+    else:
+        non_enregistre = any(
+            str(row[j]) != str(st.session_state["planning_db"].get(f"{semaine_sel}_{row['Mécanicien']}_{j}"))
+            for _, row in edited_df.iterrows() for j in jours
+        )
+        if non_enregistre:
+            st.warning("⚠️ Modifications non enregistrées : cliquez sur « Enregistrer les heures de la semaine » pour qu'elles soient prises en compte (planning et prime).")
+
+    saisies_invalides = [
+        f"{row['Mécanicien']} - {j} : « {row[j]} »"
+        for _, row in edited_df.iterrows() for j in jours
+        if valeur_en_minutes(row[j]) is None
+        and normaliser_code_planning(row[j]) not in CODES_ABSENCE
+    ]
+    if saisies_invalides:
+        st.error("Saisies non reconnues (comptées comme 0) : " + " ; ".join(saisies_invalides))
 
     st.divider()
     st.subheader("📊 Récapitulatif Hebdomadaire des Heures")
 
     def total_heures_semaine(row):
-        total_minutes = 0
-        for j in jours:
-            val = str(row[j]).strip()
-            if ":" in val:
-                try:
-                    h, m = map(int, val.split(":"))
-                    total_minutes += h * 60 + m
-                except Exception:
-                    pass
-        tot_h = total_minutes // 60
-        tot_m = total_minutes % 60
-        return f"{tot_h:02d}h{tot_m:02d}"
+        total_minutes = sum((valeur_en_minutes(row[j]) or 0) for j in jours)
+        return f"{total_minutes // 60:02d}h{total_minutes % 60:02d}"
+
+    def total_jours_semaine(row):
+        return round(sum(valeur_en_jour(row[j]) for j in jours), 2)
 
     df_recap = edited_df.copy()
     df_recap["Total Semaine"] = df_recap.apply(total_heures_semaine, axis=1)
+    df_recap["Jours travaillés (équiv.)"] = df_recap.apply(total_jours_semaine, axis=1)
     st.dataframe(df_recap, use_container_width=True)
 
     excel_planning = to_excel(df_recap)
@@ -450,10 +496,11 @@ else:
     st.info(
         "💡 **Principe :** on prend le fichier du mois (un seul fichier), puis on va chercher dans le **planning** "
         "le nombre de **jours travaillés** de chaque mécanicien sur la période choisie.\n\n"
-        "**Moyenne de vélos par jour travaillé** = total des vélos ÷ jours travaillés. "
+        "**Moyenne de vélos par jour réellement travaillé** = total des vélos ÷ présence travaillée. "
         "Cette moyenne passe dans le **même barème qu'avant** : moins de 6 vélos/jour = 0 € ; "
         "6 vélos/jour = 50 € (+26,25 € par vélo en plus) ; 10 vélos/jour et plus = 155 € max. "
-        "**Prime mensuelle** = prime du jour × jours travaillés."
+        "**Prime mensuelle** = prime du jour × jours travaillés. "
+        "Les journées partielles comptent en fraction de jour (7h = 1 jour ; 3h30 ou code 0.5 = 0,5 jour). Les CP et ANR sont exclus du calcul."
     )
 
     fichier_mois = st.file_uploader("📂 Injecter le fichier du mois (Excel / CSV)", type=["xls", "xlsx", "csv"], key="fichier_mois")
@@ -463,6 +510,8 @@ else:
     fin_def = (debut_def + datetime.timedelta(days=32)).replace(day=1) - datetime.timedelta(days=1)
 
     periode = st.date_input("📆 Période du planning à prendre en compte (du ... au ...)", value=(debut_def, fin_def), format="DD/MM/YYYY")
+
+    heures_jour = st.number_input("⏱️ Nombre d'heures correspondant à 1 jour complet", min_value=1.0, max_value=24.0, value=HEURES_JOUR_DEFAUT, step=0.5)
 
     if fichier_mois is None:
         st.warning("Injectez le fichier du mois pour lancer le calcul.")
@@ -507,9 +556,9 @@ else:
                     choix = c2.selectbox("Planning", options, index=idx, key=f"map_{acteur}", label_visibility="collapsed")
 
                     if choix == MANUEL:
-                        jours_trav = int(st.number_input(f"Jours travaillés - {acteur}", min_value=0, max_value=366, value=0, key=f"jt_{acteur}"))
+                        jours_trav = float(st.number_input(f"Jours travaillés - {acteur}", min_value=0.0, max_value=366.0, value=0.0, step=0.5, key=f"jt_{acteur}"))
                     else:
-                        jours_trav, manq = compter_jours_travailles(choix, debut, fin)
+                        jours_trav, manq = compter_jours_travailles(choix, debut, fin, heures_jour)
                         semaines_manquantes |= manq
 
                     moyenne = nb_velos / jours_trav if jours_trav > 0 else 0.0
@@ -527,7 +576,7 @@ else:
                     st.warning(
                         "⚠️ Ces semaines n'ont jamais été ouvertes dans le planning : "
                         + ", ".join(f"S{w}" for w in sorted(semaines_manquantes))
-                        + ". Valeurs par défaut utilisées (lundi à vendredi = travaillé). Vérifiez-les dans la section Planning."
+                        + ". Valeurs par défaut utilisées (lundi à vendredi = 1 jour). Vérifiez-les dans la section Planning."
                     )
 
                 if lignes:
@@ -542,6 +591,7 @@ else:
                     st.subheader("Prime mensuelle par mécanicien")
                     st.dataframe(
                         recap.style.format({
+                            "Jours travaillés": "{:.2f}",
                             "Moyenne vélos / jour": "{:.2f}",
                             "Prime / jour (€)": "{:.2f} €",
                             "Prime mensuelle (€)": "{:.2f} €"
