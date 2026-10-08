@@ -30,10 +30,6 @@ if "authenticated_user" not in st.session_state:
 if "planning_db" not in st.session_state:
     st.session_state["planning_db"] = {}
 
-# Historique des vélos sortis : { "2026-10-08": {"Mécanicien": nb_velos, ...}, ... }
-if "historique_velos" not in st.session_state:
-    st.session_state["historique_velos"] = {}
-
 # --- ÉCRAN DE CONNEXION ---
 if st.session_state["authenticated_user"] is None:
     st.title(f"🔒 Connexion - {NOM_SITE}")
@@ -199,6 +195,57 @@ def color_eligibility(val):
     return 'background-color: #f8d7da; color: #721c24; font-weight: bold;'
 
 
+
+JOURS_SEMAINE = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+MANUEL = "✍️ Saisir les jours manuellement"
+
+
+def heures_en_minutes(val):
+    """'07:30' -> 450. Valeur vide ou invalide -> 0."""
+    val = str(val).strip()
+    if ":" not in val:
+        return 0
+    try:
+        h, m = map(int, val.split(":")[:2])
+        return h * 60 + m
+    except Exception:
+        return 0
+
+
+def compter_jours_travailles(nom_mecanicien, debut, fin):
+    """Compte les jours avec des heures > 0 dans le planning, entre debut et fin (inclus).
+    Retourne (nb_jours, semaines_non_saisies)."""
+    nb = 0
+    semaines_manquantes = set()
+    jour = debut
+    while jour <= fin:
+        _, semaine, num_jour = jour.isocalendar()
+        nom_jour = JOURS_SEMAINE[num_jour - 1]
+        key = f"Semaine {semaine}_{nom_mecanicien}_{nom_jour}"
+        if key in st.session_state["planning_db"]:
+            minutes = heures_en_minutes(st.session_state["planning_db"][key])
+        else:
+            # Semaine jamais ouverte dans le planning : valeur par défaut (lundi-vendredi = travaillé)
+            semaines_manquantes.add(semaine)
+            minutes = 420 if num_jour <= 5 else 0
+        if minutes > 0:
+            nb += 1
+        jour += datetime.timedelta(days=1)
+    return nb, semaines_manquantes
+
+
+def trouver_mecanicien_planning(nom_fichier, noms_planning):
+    """Retourne le nom du planning le plus proche du nom trouvé dans le fichier (ou None)."""
+    import difflib
+    norm = lambda x: re.sub(r"\s+", " ", str(x).strip().lower())
+    table = {norm(n): n for n in noms_planning}
+    cible = norm(nom_fichier)
+    if cible in table:
+        return table[cible]
+    proche = difflib.get_close_matches(cible, list(table.keys()), n=1, cutoff=0.6)
+    return table[proche[0]] if proche else None
+
+
 # --- NAVIGATION DE L'APPLICATION ---
 st.title(f"📊 {NOM_SITE} - Analyse, Primes & Planning")
 
@@ -236,7 +283,7 @@ if menu_option == "📅 Planning & Saisie de Présence (S1 à S52)":
         for j in jours:
             key = f"{semaine_sel}_{mecanicien}_{j}"
             if key not in st.session_state["planning_db"]:
-                st.session_state["planning_db"][key] = "07:00"
+                st.session_state["planning_db"][key] = "00:00" if j in ("Samedi", "Dimanche") else "07:00"
             row[j] = st.session_state["planning_db"][key]
         records.append(row)
 
@@ -357,17 +404,6 @@ elif menu_option == "📈 Analyse Quotidienne (Excel/CSV)":
 
                 st.bar_chart(agent_bikes.set_index(actor_col)['Velos_Sortis'])
 
-                st.divider()
-                st.markdown("##### 🗓️ Ajouter cette journée au calcul de la prime mensuelle")
-                date_jour = st.date_input(
-                    "Date de ce fichier",
-                    value=date_depuis_nom(uploaded_file.name),
-                    key="date_fichier_jour"
-                )
-                if st.button("➕ Ajouter à l'historique du mois"):
-                    st.session_state["historique_velos"][date_jour.isoformat()] = compter_velos_par_acteur(df)
-                    st.success(f"Journée du {date_jour.strftime('%d/%m/%Y')} ajoutée à l'historique.")
-
             with tab2:
                 st.subheader("Analyse des Catégories A, B, C par acteur")
                 if cat_abc_col in df.columns:
@@ -412,105 +448,112 @@ elif menu_option == "📈 Analyse Quotidienne (Excel/CSV)":
 else:
     st.header("💶 Calcul de la Prime Mensuelle")
     st.info(
-        "💡 **Mêmes critères que la prime journalière :** chaque jour, un mécanicien touche "
-        "**0 €** s'il sort moins de 6 vélos, **50,00 €** à 6 vélos (+26,25 € par vélo supplémentaire), "
-        "et **155,00 € maximum** à partir de 10 vélos. La prime du mois est la **somme des primes de chaque journée**."
+        "💡 **Principe :** on prend le fichier du mois (un seul fichier), puis on va chercher dans le **planning** "
+        "le nombre de **jours travaillés** de chaque mécanicien sur la période choisie.\n\n"
+        "**Moyenne de vélos par jour travaillé** = total des vélos ÷ jours travaillés. "
+        "Cette moyenne passe dans le **même barème qu'avant** : moins de 6 vélos/jour = 0 € ; "
+        "6 vélos/jour = 50 € (+26,25 € par vélo en plus) ; 10 vélos/jour et plus = 155 € max. "
+        "**Prime mensuelle** = prime du jour × jours travaillés."
     )
 
-    fichiers = st.file_uploader(
-        "📂 Injecter les fichiers journaliers du mois (un fichier par jour, plusieurs possibles)",
-        type=["xls", "xlsx", "csv"],
-        accept_multiple_files=True
-    )
+    fichier_mois = st.file_uploader("📂 Injecter le fichier du mois (Excel / CSV)", type=["xls", "xlsx", "csv"], key="fichier_mois")
 
-    # Données issues des fichiers injectés ici (la date est déduite du nom, modifiable)
-    jours_importes = {}
-    if fichiers:
-        st.markdown("##### 🗓️ Date de chaque fichier")
-        for f in fichiers:
-            c1, c2 = st.columns([2, 1])
-            c1.write(f"📄 {f.name}")
-            d = c2.date_input("Date", value=date_depuis_nom(f.name), key=f"date_{f.name}", label_visibility="collapsed")
-            try:
-                comptes = compter_velos_par_acteur(lire_fichier(f))
-                if comptes is None:
-                    st.warning(f"Colonnes « {ACTOR_COL} » / « {MAT_COL} » introuvables dans {f.name}.")
-                else:
-                    jours_importes[d.isoformat()] = comptes
-            except Exception as e:
-                st.error(f"Erreur sur {f.name} : {e}")
+    aujourd_hui = datetime.date.today()
+    debut_def = aujourd_hui.replace(day=1)
+    fin_def = (debut_def + datetime.timedelta(days=32)).replace(day=1) - datetime.timedelta(days=1)
 
-    # Historique (journées ajoutées depuis l'analyse quotidienne) + fichiers injectés (prioritaires si même date)
-    donnees = dict(st.session_state["historique_velos"])
-    donnees.update(jours_importes)
+    periode = st.date_input("📆 Période du planning à prendre en compte (du ... au ...)", value=(debut_def, fin_def), format="DD/MM/YYYY")
 
-    if not donnees:
-        st.warning("Aucune journée disponible. Injectez des fichiers ci-dessus ou ajoutez des journées depuis l'« Analyse Quotidienne ».")
+    if fichier_mois is None:
+        st.warning("Injectez le fichier du mois pour lancer le calcul.")
+    elif not (isinstance(periode, (tuple, list)) and len(periode) == 2):
+        st.warning("Sélectionnez une date de début ET une date de fin.")
     else:
-        lignes = []
-        for date_iso, comptes in donnees.items():
-            for acteur, nb in comptes.items():
-                lignes.append({
-                    "Date": datetime.date.fromisoformat(date_iso),
-                    "Mécanicien": acteur,
-                    "Velos_Sortis": int(nb),
-                    "Prime (€)": calculer_prime(nb)
-                })
-        df_jours = pd.DataFrame(lignes)
-        df_jours["Mois"] = df_jours["Date"].apply(lambda d: f"{d.year}-{d.month:02d}")
+        debut, fin = periode
+        try:
+            df_m = lire_fichier(fichier_mois)
+        except Exception as e:
+            st.error(f"Erreur lors de la lecture du fichier : {e}")
+            df_m = None
 
-        mois_dispo = sorted(df_jours["Mois"].unique(), reverse=True)
+        if df_m is not None:
+            if ACTOR_COL not in df_m.columns or MAT_COL not in df_m.columns:
+                st.error(f"Colonnes « {ACTOR_COL} » et/ou « {MAT_COL} » introuvables dans le fichier.")
+            else:
+                # Filtre optionnel par date d'intervention
+                choix_col = st.selectbox(
+                    "🗓️ Colonne de date des interventions (optionnel, pour ne garder que la période)",
+                    ["(aucune - utiliser tout le fichier)"] + list(df_m.columns)
+                )
+                df_f = df_m.copy()
+                if not choix_col.startswith("(aucune"):
+                    dates = pd.to_datetime(df_f[choix_col], dayfirst=True, errors="coerce").dt.date
+                    df_f = df_f[(dates >= debut) & (dates <= fin)]
 
-        def label_mois(m):
-            a, mm = m.split("-")
-            return f"{MOIS_FR[int(mm) - 1]} {a}"
+                velos = df_f.groupby(ACTOR_COL)[MAT_COL].count()
+                noms_planning = [u["nom"] for u in st.session_state["users_db"].values()]
 
-        mois_sel = st.selectbox("📆 Mois à calculer :", mois_dispo, format_func=label_mois)
-        df_mois = df_jours[df_jours["Mois"] == mois_sel].copy()
+                st.subheader("🔗 Association des agents du fichier avec le planning")
+                st.caption("Choisissez le mécanicien du planning correspondant à chaque agent du fichier, ou saisissez les jours à la main.")
 
-        recap = df_mois.groupby("Mécanicien").agg(
-            Jours_Comptabilisés=("Date", "nunique"),
-            Total_Velos=("Velos_Sortis", "sum"),
-            Jours_Avec_Prime=("Prime (€)", lambda s: int((s > 0).sum())),
-            Prime_Mensuelle=("Prime (€)", "sum")
-        ).reset_index().sort_values("Prime_Mensuelle", ascending=False)
+                lignes = []
+                semaines_manquantes = set()
+                for acteur, nb_velos in velos.items():
+                    c1, c2 = st.columns([2, 2])
+                    c1.markdown(f"**{acteur}** : {int(nb_velos)} vélos")
+                    options = noms_planning + [MANUEL]
+                    defaut = trouver_mecanicien_planning(acteur, noms_planning)
+                    idx = options.index(defaut) if defaut else len(options) - 1
+                    choix = c2.selectbox("Planning", options, index=idx, key=f"map_{acteur}", label_visibility="collapsed")
 
-        recap.columns = ["Mécanicien", "Jours comptabilisés", "Total vélos sortis",
-                         "Jours avec prime", "Prime mensuelle (€)"]
+                    if choix == MANUEL:
+                        jours_trav = int(st.number_input(f"Jours travaillés - {acteur}", min_value=0, max_value=366, value=0, key=f"jt_{acteur}"))
+                    else:
+                        jours_trav, manq = compter_jours_travailles(choix, debut, fin)
+                        semaines_manquantes |= manq
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Jours comptabilisés", df_mois["Date"].nunique())
-        c2.metric("Total vélos sortis", int(df_mois["Velos_Sortis"].sum()))
-        c3.metric("Total primes du mois", f"{recap['Prime mensuelle (€)'].sum():.2f} €")
+                    moyenne = nb_velos / jours_trav if jours_trav > 0 else 0.0
+                    prime_jour = calculer_prime(moyenne)
+                    lignes.append({
+                        "Mécanicien": acteur,
+                        "Total vélos": int(nb_velos),
+                        "Jours travaillés": jours_trav,
+                        "Moyenne vélos / jour": round(moyenne, 2),
+                        "Prime / jour (€)": prime_jour,
+                        "Prime mensuelle (€)": round(prime_jour * jours_trav, 2)
+                    })
 
-        st.subheader(f"Prime mensuelle par mécanicien - {label_mois(mois_sel)}")
-        st.dataframe(
-            recap.style.format({"Prime mensuelle (€)": "{:.2f} €"}),
-            use_container_width=True
-        )
+                if semaines_manquantes:
+                    st.warning(
+                        "⚠️ Ces semaines n'ont jamais été ouvertes dans le planning : "
+                        + ", ".join(f"S{w}" for w in sorted(semaines_manquantes))
+                        + ". Valeurs par défaut utilisées (lundi à vendredi = travaillé). Vérifiez-les dans la section Planning."
+                    )
 
-        st.subheader("Détail jour par jour")
-        pivot = df_mois.pivot_table(
-            index="Mécanicien", columns="Date", values="Prime (€)", aggfunc="sum", fill_value=0.0
-        )
-        pivot.columns = [d.strftime("%d/%m") for d in pivot.columns]
-        st.dataframe(pivot.style.format("{:.2f} €"), use_container_width=True)
+                if lignes:
+                    recap = pd.DataFrame(lignes).sort_values("Prime mensuelle (€)", ascending=False)
 
-        detail = df_mois[["Date", "Mécanicien", "Velos_Sortis", "Prime (€)"]].sort_values(["Date", "Mécanicien"])
-        excel_mois = to_excel_multi({
-            "Prime mensuelle": recap,
-            "Détail journalier": detail
-        })
-        st.download_button(
-            label="📥 Télécharger le rapport mensuel (Excel)",
-            data=excel_mois,
-            file_name=f"prime_mensuelle_{mois_sel}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+                    st.divider()
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Période", f"{debut.strftime('%d/%m/%Y')} → {fin.strftime('%d/%m/%Y')}")
+                    m2.metric("Total vélos", int(recap["Total vélos"].sum()))
+                    m3.metric("Total primes", f"{recap['Prime mensuelle (€)'].sum():.2f} €")
 
-        if st.session_state["historique_velos"]:
-            with st.expander("🗂️ Historique enregistré"):
-                st.write(sorted(st.session_state["historique_velos"].keys()))
-                if st.button("🗑️ Vider l'historique"):
-                    st.session_state["historique_velos"] = {}
-                    st.rerun()
+                    st.subheader("Prime mensuelle par mécanicien")
+                    st.dataframe(
+                        recap.style.format({
+                            "Moyenne vélos / jour": "{:.2f}",
+                            "Prime / jour (€)": "{:.2f} €",
+                            "Prime mensuelle (€)": "{:.2f} €"
+                        }),
+                        use_container_width=True
+                    )
+
+                    st.download_button(
+                        label="📥 Télécharger le rapport mensuel (Excel)",
+                        data=to_excel(recap),
+                        file_name=f"prime_mensuelle_{debut}_{fin}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                else:
+                    st.warning("Aucune intervention trouvée sur la période.")
